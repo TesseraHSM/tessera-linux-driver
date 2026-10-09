@@ -1,0 +1,1044 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "tsra_ctrl.h"
+#include "tsra.h"
+#include "tsra_ctrl_cmd.h"
+#include "tsra_abort.h"
+#include "tsra_ctrl_dev_ioctl.h"
+#include <linux/module.h>
+#include <linux/idr.h>
+#include <linux/uaccess.h>
+#include <linux/version.h>
+#include <linux/workqueue.h>
+#include <linux/timer.h>
+#include <linux/delay.h>
+
+#define TSRA_CTRL_DMA_PAGE_SIZE SZ_4K
+#define TSRA_CTRL_IOQ_ID 0
+#define TSRA_CTRL_IOQ_SIZE 16
+#define TSRA_CTRL_IRQ_NUM 0
+#define TSRA_CTRL_MAX_RES_CNT ((u8)64)
+
+static u8 tsra_ctrl_pf_res_cnt = 1;
+
+module_param_named(pf_res_cnt, tsra_ctrl_pf_res_cnt, byte, 0444);
+MODULE_PARM_DESC(pf_res_cnt,
+		 "Physical function resource count. Default: 1 Max: 64");
+
+static bool tsra_ctrl_no_fp;
+
+module_param_named(no_fp, tsra_ctrl_no_fp, bool, 0444);
+MODULE_PARM_DESC(
+	no_fp,
+	"Bring up without the fast path (FP) bulk crypto engine. Skips AES device creation, its IO queues and the AES ioctls, so the driver can load against firmware whose FP does not implement bulk crypto. Default: N");
+
+/*
+ * Whether the fast path (FP) bulk crypto support is disabled for this load.
+ * Exported for the abort and ioctl paths, which must not touch AES state that
+ * was never initialised.
+ */
+bool tsra_ctrl_fp_disabled(void)
+{
+	return tsra_ctrl_no_fp;
+}
+
+static size_t tsra_ctrl_ioq_ops_page_size(void)
+{
+	return TSRA_CTRL_DMA_PAGE_SIZE;
+}
+
+static void tsra_ctrl_ioq_ops_set_io_data(void *cmd, unsigned int data)
+{
+	struct tsra_ctrl_cmd *ctrl_cmd = cmd;
+
+	ctrl_cmd->io_data = data;
+}
+
+static unsigned int tsra_ctrl_ioq_ops_get_io_data(void *cmd)
+{
+	struct tsra_ctrl_cmd *ctrl_cmd = cmd;
+
+	return ctrl_cmd->io_data;
+}
+
+static u16 tsra_ctrl_ioq_ops_cqe_size(void)
+{
+	return TSRA_CTRL_CMD_CQE_SIZE;
+}
+
+static void *tsra_ctrl_ioq_ops_cqe(void *cmd)
+{
+	struct tsra_ctrl_cmd *ctrl_cmd = cmd;
+
+	return &ctrl_cmd->cqe;
+}
+
+static u16 tsra_ctrl_ioq_ops_cqe_get_cid(void *cqe)
+{
+	struct tsra_ctrl_cmd_cqe *ctrl_cqe = cqe;
+
+	return ctrl_cqe->cid;
+}
+
+static u16 tsra_ctrl_ioq_ops_cqe_get_phase(void *cqe)
+{
+	struct tsra_ctrl_cmd_cqe *ctrl_cqe = cqe;
+
+	return ctrl_cqe->psf.fld.p;
+}
+
+static u16 tsra_ctrl_ioq_ops_cqe_get_sq_head(void *cqe)
+{
+	struct tsra_ctrl_cmd_cqe *ctrl_cqe = cqe;
+
+	return ctrl_cqe->sqhd;
+}
+
+static u16 tsra_ctrl_ioq_ops_sqe_size(void)
+{
+	return TSRA_CTRL_CMD_SQE_SIZE;
+}
+
+static void *tsra_ctrl_ioq_ops_sqe(void *cmd)
+{
+	struct tsra_ctrl_cmd *ctrl_cmd = cmd;
+
+	return &ctrl_cmd->sqe;
+}
+
+static void tsra_ctrl_ioq_ops_sqe_set_cid(void *sqe, u16 cid)
+{
+	union tsra_ctrl_cmd_sqe *ctrl_sqe = sqe;
+
+	ctrl_sqe->any.hdr.cid = cid;
+}
+
+static int tsra_ctrl_ioq_ops_complete_cmd(void *cmd,
+					  const int completion_status)
+{
+	struct tsra_ctrl_cmd *ctrl_cmd = cmd;
+
+	ctrl_cmd->completion_status = completion_status;
+
+	complete(&ctrl_cmd->cmpl);
+
+	return 0;
+}
+
+static struct tsra_ioq_ops tsra_ctrl_ioq_ops = {
+	.page_size = tsra_ctrl_ioq_ops_page_size,
+	.set_io_data = tsra_ctrl_ioq_ops_set_io_data,
+	.get_io_data = tsra_ctrl_ioq_ops_get_io_data,
+	.cqe_size = tsra_ctrl_ioq_ops_cqe_size,
+	.cqe = tsra_ctrl_ioq_ops_cqe,
+	.cqe_get_cid = tsra_ctrl_ioq_ops_cqe_get_cid,
+	.cqe_get_phase = tsra_ctrl_ioq_ops_cqe_get_phase,
+	.cqe_get_sq_head = tsra_ctrl_ioq_ops_cqe_get_sq_head,
+	.sqe_size = tsra_ctrl_ioq_ops_sqe_size,
+	.sqe = tsra_ctrl_ioq_ops_sqe,
+	.sqe_set_cid = tsra_ctrl_ioq_ops_sqe_set_cid,
+	.complete_cmd = tsra_ctrl_ioq_ops_complete_cmd,
+	.get_tag = NULL,
+	.set_tag = NULL,
+};
+
+static int tsra_ctrl_page_pool_create(struct tsra_ctrl *ctrl,
+					const bool abort)
+{
+	int err;
+
+	if (true == abort)
+		return 0;
+
+	ctrl->page_pool = dma_pool_create(TSRA_CTRL_DEV_NAME,
+					  &ctrl->pdev->dev,
+					  TSRA_CTRL_DMA_PAGE_SIZE,
+					  TSRA_CTRL_DMA_PAGE_SIZE, 0);
+	if (!ctrl->page_pool) {
+		err = -ENOMEM;
+		TSRA_DEV_LOG_ERROR(
+			&ctrl->pdev->dev,
+			"[%s]:Controller page pool creation failure", __func__);
+		goto dma_pool_fail;
+	}
+
+	return 0;
+
+dma_pool_fail:
+	return err;
+}
+
+static void tsra_ctrl_page_pool_destroy(struct tsra_ctrl *ctrl,
+					const bool abort)
+{
+	if (true == abort)
+		return;
+	/* normal shutdown */
+	if (!ctrl->page_pool)
+		return;
+
+	dma_pool_destroy(ctrl->page_pool);
+	ctrl->page_pool = NULL;
+}
+
+/*
+ * This function can be called from level-2 abort
+ * to perform the crash recovery. In that case the
+ * CFS bit could be set and the firmware would be
+ * In crash recovery stages. The driver should give
+ * enough time to the firmware to recover the
+ * controller. We will only check for the CFS bit
+ * when the controller has completed the requested
+ * operation.
+ *
+ */
+static int tsra_ctrl_hw_wait_ready(struct tsra_ctrl *ctrl, bool enable)
+{
+	int err;
+	union tsra_ctrl_reg_cap cap;
+	union tsra_ctrl_reg_csts csts;
+	unsigned long timeout;
+	int ready = enable ? 1 : 0;
+	unsigned int inv_rd_rtry_cnt = 5;
+	const struct device *dev = &ctrl->pdev->dev;
+
+	cap.val = readq(&ctrl->reg->cap);
+	timeout = ((cap.fld.to + 1) * HZ / 2) + jiffies;
+
+	TSRA_DEV_LOG_ENTRY(dev, "%s controller\n",
+			   enable ? "enabling" : "disabling");
+	for (;;) {
+		csts.val = readl(&ctrl->reg->csts);
+
+		if (csts.val == ~0) {
+
+			if (inv_rd_rtry_cnt) {
+
+				TSRA_DEV_LOG_ERROR(dev,"Bad Device Sts [CSTS:0x%x] [inv_rd_rtry_cnt:%u]\n",
+					csts.val,inv_rd_rtry_cnt);
+
+				inv_rd_rtry_cnt--;
+				mdelay(50); // 50 milliseconds delay before retrying
+				continue;
+			}
+
+			TSRA_DEV_LOG_ERROR(dev, "device has gone [CSTS:0x%x]\n", csts.val);
+			err = -ENODEV;
+			goto err;
+		}
+
+		if (csts.fld.rdy == ready) {
+			TSRA_DEV_LOG_ALWAYS(dev, "controller %s [CSTS:0x%x]\n",
+					    enable ? "enabled" : "disabled", csts.val);
+
+			if (csts.fld.cfs) {
+				TSRA_DEV_LOG_ERROR(
+					dev,
+					"controller has faulted [CSTS:0x%x]\n",
+					csts.val);
+
+				err = -EFAULT;
+				goto err;
+			}
+
+			break;
+		}
+
+		if (time_after(jiffies, timeout)) {
+			TSRA_DEV_LOG_ERROR(dev, "controller has timedout [CSTS:0x%x]\n", csts.val);
+			err = -ETIMEDOUT;
+			goto err;
+		}
+	}
+
+	return 0;
+
+err:
+	return err;
+}
+
+/**
+ * tsra_ctrl_disable_enabled_controller
+ * @ctrl :- Controller instance
+ *
+ * If controller is enabled, disables the
+ * controller.
+ *
+ * Returns: 0 on success.
+ */
+static int tsra_ctrl_disable_enabled_controller(struct tsra_ctrl *ctrl)
+{
+	union tsra_ctrl_reg_cc cc;
+	union tsra_ctrl_reg_csts csts;
+	int ret = 0;
+
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "[ENTRY] %s tsra_ctrl:%p\n",
+			   __func__, ctrl);
+
+	csts.val = readl(&ctrl->reg->csts);
+	cc.val = readl(&ctrl->reg->cc);
+	TSRA_DEV_LOG_ALWAYS(
+		&ctrl->pdev->dev,
+		"[%s ctrl:%p CSTS REGISTER VALUE:0x%x CC REGISTER VALUE:0x%x\n",
+		__func__, ctrl, csts.val, cc.val);
+	if (csts.fld.rdy || cc.fld.en) {
+		/*
+		 * Controller is enabled.
+		 */
+		TSRA_DEV_LOG_ALWAYS(
+			&ctrl->pdev->dev,
+			"[controller enabled. Disabling] %s tsra_ctrl:%p\n",
+			__func__, ctrl);
+
+		ret = tsra_ctrl_hw_disable(ctrl);
+		if (ret) {
+			TSRA_DEV_LOG_ERROR(
+				&ctrl->pdev->dev,
+				"[ERROR] %s disabling controller:%p during startup failed. ret:%d\n",
+				__func__, ctrl, ret);
+		}
+	} else {
+		TSRA_DEV_LOG_ALWAYS(
+			&ctrl->pdev->dev,
+			"[controller not enabled. Nothing to do] %s tsra_ctrl:%p\n",
+			__func__, ctrl);
+
+		ret = 0;
+	}
+
+	TSRA_DEV_LOG_ALWAYS(&ctrl->pdev->dev,
+			    "[EXIT] %s tsra_ctrl:%p return value:%d\n",
+			    __func__, ctrl, ret);
+	return ret;
+}
+
+int tsra_ctrl_hw_enable(struct tsra_ctrl *ctrl)
+{
+	int err;
+	u64 asq_dma_addr, acq_dma_addr;
+	union tsra_ctrl_reg_aqa aqa;
+	union tsra_ctrl_reg_cc cc;
+	union tsra_ctrl_reg_vs vs;
+
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			   ctrl);
+
+	/*
+	 * Before enabling the controller, check to see
+	 * if the controller is already enabled and if it is
+	 * enabled, disable the controller
+	 * This is needed for the case where the machine is
+	 * powered off in an abnormal manner (VM power off)
+	 * but the controller is left in an enabled state
+	 * The following can fail and if it does fail,
+	 * return error
+	 */
+	err = tsra_ctrl_disable_enabled_controller(ctrl);
+	if (err)
+		return err;
+
+	/*
+	 * Update the admin queue attributes with submission and completion
+	 * queue size.
+	 * Note: The queue sizes are zero based
+	 * The following operations assume that the controller is disabled
+	 */
+	aqa.val = readl(&ctrl->reg->aqa);
+	aqa.fld.asqs = TSRA_CTRL_IOQ_SIZE - 1;
+	aqa.fld.acqs = TSRA_CTRL_IOQ_SIZE - 1;
+	writel(aqa.val, &ctrl->reg->aqa);
+
+	// Update the submission queue dma address
+	asq_dma_addr = tsra_ioq_sq_dma_addr(&ctrl->ioq);
+	writeq(asq_dma_addr, &ctrl->reg->asq);
+
+	// Update the completion queue dma address
+	acq_dma_addr = tsra_ioq_cq_dma_addr(&ctrl->ioq);
+	writeq(acq_dma_addr, &ctrl->reg->acq);
+
+	// Set the controller enable bit
+	cc.val = readl(&ctrl->reg->cc);
+	cc.fld.en = 1;
+	writel(cc.val, &ctrl->reg->cc);
+
+	err = tsra_ctrl_hw_wait_ready(ctrl, true);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			&ctrl->pdev->dev,
+			"[ERROR] %s tsra_ctrl:%p tsra_ctrl_hw_wait_ready failed err:%d\n",
+			__func__, ctrl, err);
+		goto hw_ready_err;
+	}
+
+	vs.val = readl(&ctrl->reg->vs);
+	TSRA_DEV_LOG_EXIT(&ctrl->pdev->dev, "controller version %u.%u.%u\n",
+			  vs.fld.mjr, vs.fld.mnr, vs.fld.ter);
+
+	return 0;
+
+hw_ready_err:
+	return err;
+}
+
+int tsra_ctrl_hw_nssr(struct tsra_ctrl *ctrl)
+{
+	int err;
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			   ctrl);
+
+	writel(NVME_SS_RESET_SIGNATURE, &ctrl->reg->ssr);
+
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s Issued NSSR |Waiting For Rdy To Clear|\n", __func__);
+
+	err = tsra_ctrl_hw_wait_ready(ctrl, false);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			&ctrl->pdev->dev,
+			"[ERROR] %s tsra_ctrl:%p tsra_ctrl_hw_wait_ready failed err:%d\n",
+			__func__, ctrl, err);
+		return err;
+	}
+
+	return 0;
+}
+
+int tsra_ctrl_hw_disable(struct tsra_ctrl *ctrl)
+{
+	int err;
+	union tsra_ctrl_reg_cc cc;
+
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			   ctrl);
+
+	if ( !ctrl->reg ) {
+		TSRA_DEV_LOG_ERROR( &ctrl->pdev->dev,
+			"%s: Registers are not mapped, skipping the disable\n", __func__);
+		return 0;
+	}
+
+	// Clear the controller enable bit
+	cc.val = readl(&ctrl->reg->cc);
+	cc.fld.en = 0;
+	writel(cc.val, &ctrl->reg->cc);
+
+	err = tsra_ctrl_hw_wait_ready(ctrl, false);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			&ctrl->pdev->dev,
+			"[ERROR] %s tsra_ctrl:%p tsra_ctrl_hw_wait_ready failed err:%d\n",
+			__func__, ctrl, err);
+		goto hw_ready_err;
+	}
+
+	TSRA_DEV_LOG_EXIT(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			  ctrl);
+	return 0;
+
+hw_ready_err:
+	return err;
+}
+
+static irqreturn_t tsra_ctrl_irq(int irq, void *data)
+{
+	struct tsra_ctrl *ctrl = data;
+
+	if (!ctrl) {
+		TSRA_LOG_ERROR("[%s] Called With Null Pointer", __func__);
+
+		// Interrrupt was not from this device/we are not handling it
+		return IRQ_NONE;
+	}
+
+	tasklet_schedule(&ctrl->tasklet);
+	return IRQ_HANDLED;
+}
+
+static void tsra_ctrl_soft_irq(unsigned long data)
+{
+	struct tsra_ctrl *ctrl = (struct tsra_ctrl *)data;
+
+	if (!ctrl) {
+		TSRA_LOG_ERROR("[%s] Called With Null Pointer", __func__);
+		return;
+	}
+
+	tsra_ioq_complete_cmds(&ctrl->ioq);
+}
+
+/*
+ * Function :- tsra_log_ctrl_ident
+ * Log the serial number, model number
+ * and firmware revision to kernel log
+ * Note these are not NULL terminated
+ */
+static void tsra_log_ctrl_ident(struct device *dev, struct tsra_ctrl *ctrl)
+{
+	int i;
+
+	TSRA_DEV_LOG_ENTRY(dev, "controller id %d\n", ctrl->ident->ctrl_id);
+	/* log the serial number model number and firmware version */
+	{
+		char buf[TSRA_CTRL_IDENT_SN_LEN + 1];
+
+		for (i = 0; i < TSRA_CTRL_IDENT_SN_LEN; i++)
+			buf[i] = ctrl->ident->sn[i];
+
+		buf[i] = 0;
+		TSRA_DEV_LOG_INFO(dev, "Controller serial number:%s\n", buf);
+	}
+
+	{
+		char buf[TSRA_CTRL_IDENT_FR_LEN + 1];
+		{
+			for (i = 0; i < TSRA_CTRL_IDENT_FR_LEN; i++)
+				buf[i] = ctrl->ident->fr[i];
+
+			buf[i] = 0;
+		}
+
+		TSRA_DEV_LOG_INFO(dev, "Controller firmware revision:%s\n",
+				  buf);
+	}
+}
+
+static int tsra_ctrl_ident_init(struct tsra_ctrl *ctrl)
+{
+	int err;
+	void *pg;
+	dma_addr_t pg_dma_addr;
+	struct device *dev = &ctrl->pdev->dev;
+
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			   ctrl);
+
+	pg = dma_pool_alloc(ctrl->page_pool, GFP_KERNEL, &pg_dma_addr);
+	if (!pg) {
+		err = -ENOMEM;
+		TSRA_DEV_LOG_ERROR(
+			dev, "[%s: tsra_ctrl:%p] Ident page alloc failure",
+			__func__, ctrl);
+		goto page_alloc_fail;
+	}
+
+	err = tsra_ctrl_cmd_ident(ctrl, pg_dma_addr);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			dev,
+			"[%s: tsra_ctrl:%p] tsra_ctrl_cmd_ident failed",
+			__func__, ctrl);
+		goto cmd_fail;
+	}
+
+	ctrl->ident = pg;
+	ctrl->ident_dma_addr = pg_dma_addr;
+
+	tsra_log_ctrl_ident(dev, ctrl);
+
+	/*
+	 * Basic validation of the sizes of the FP and HSM queues (to be
+	 * consistent with Windows driver)
+	 */
+	if ((ctrl->ident->cp_sqes.fld.max != CP_SQE_SZ_POWOFTWO) ||
+	    (ctrl->ident->cp_cqes.fld.max != CP_CQE_SZ_POWOFTWO) ||
+	    (ctrl->ident->fp_sqes.fld.max != FP_SQE_SZ_POWOFTWO) ||
+	    (ctrl->ident->fp_cqes.fld.max != FP_CQE_SZ_POWOFTWO)) {
+		TSRA_DEV_LOG_ERROR(
+			dev,
+			"Identify data reported by controller mismatched between CQE and SQE Reported: [CPSQES: %d, CPCQES: %d, FPSQES: %d, FPCQES: %d] Expected: [CPSQES: %d, CPCQES: %d, FPSQES: %d, FPCQES: %d]\n",
+			ctrl->ident->cp_sqes.fld.max,
+			ctrl->ident->cp_cqes.fld.max,
+			ctrl->ident->fp_sqes.fld.max,
+			ctrl->ident->fp_cqes.fld.max, CP_SQE_SZ, CP_CQE_SZ,
+			FP_SQE_SZ, FP_CQE_SZ);
+
+		err = -EINVAL;
+		goto cmd_fail;
+	}
+
+	TSRA_DEV_LOG_EXIT(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			  ctrl);
+	return 0;
+
+cmd_fail:
+	dma_pool_free(ctrl->page_pool, pg, pg_dma_addr);
+page_alloc_fail:
+	return err;
+}
+
+static void tsra_ctrl_ident_deinit(struct tsra_ctrl *ctrl)
+{
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			   ctrl);
+	if (!ctrl->ident)
+		return;
+
+	dma_pool_free(ctrl->page_pool, ctrl->ident, ctrl->ident_dma_addr);
+	ctrl->ident = NULL;
+	ctrl->ident_dma_addr = 0;
+	TSRA_DEV_LOG_EXIT(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			  ctrl);
+}
+
+static int tsra_ctrl_hsm_init(struct tsra_ctrl *ctrl, const bool abort)
+{
+	int err;
+	struct tsra_hsm_cfg cfg;
+	const struct device *dev = &ctrl->pdev->dev;
+
+	cfg.ctrl = ctrl;
+	cfg.ioq_db = ctrl->db_reg;
+	cfg.ioq_id_start = HSM_MIN_ID;
+	cfg.ioq_size = HSM_IOQ_SZ;
+	cfg.msix_max_cnt = (ctrl->irq_cnt - 1) / 2;
+	cfg.msix_start = 1;
+
+	TSRA_DEV_LOG_ENTRY(
+		dev, "%s tsra_ctrl:%p ioq_size:%d max_msix_count:%d\n",
+			   __func__, ctrl, HSM_IOQ_SZ, cfg.msix_max_cnt);
+
+	err = tsra_hsm_init(&ctrl->hsm, &cfg, abort);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(dev, "hsm init failed. err=%d", err);
+		goto init_fail;
+	}
+
+	TSRA_DEV_LOG_EXIT(dev, "%s tsra_ctrl:%p\n", __func__, ctrl);
+	/* set up back pointers */
+	ctrl->hsm.ctrl = ctrl;
+
+	return 0;
+
+init_fail:
+	return err;
+}
+
+static void tsra_ctrl_hsm_deinit(struct tsra_ctrl *ctrl, const bool abort)
+{
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			   ctrl);
+	tsra_hsm_deinit(&ctrl->hsm, abort);
+	TSRA_DEV_LOG_EXIT(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			  ctrl);
+}
+
+static void tsra_ctrl_aes_deinit(struct tsra_ctrl *ctrl, const bool abort)
+{
+	TSRA_DEV_LOG_ENTRY(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			   ctrl);
+	tsra_aes_deinit(&ctrl->aes, abort);
+	TSRA_DEV_LOG_EXIT(&ctrl->pdev->dev, "%s tsra_ctrl:%p\n", __func__,
+			  ctrl);
+}
+
+static int tsra_ctrl_aes_init(struct tsra_ctrl *ctrl, const bool abort)
+{
+	int err;
+	struct tsra_aes_cfg cfg;
+	const struct device *dev = &ctrl->pdev->dev;
+
+	cfg.ctrl = ctrl;
+	cfg.ioq_db = ctrl->db_reg;
+	cfg.ioq_id_start = AES_MIN_ID;
+	cfg.ioq_size = AES_IOQ_SZ;
+	cfg.msix_max_cnt = ctrl->irq_cnt / 2;
+	cfg.msix_start = 16;
+
+	TSRA_DEV_LOG_ENTRY(
+		dev,
+		"%s tsra_ctrl:%p id_start:%d ioq_size:%d irq_cnt:%d msix_start:%d\n",
+		__func__, ctrl, cfg.ioq_id_start, cfg.ioq_size,
+		cfg.msix_max_cnt, cfg.msix_start);
+
+	ctrl->aes.ctrl = ctrl; /* set up the back pointers */
+	err = tsra_aes_init(&ctrl->aes, &cfg, abort);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(dev, "aes init failed. err=%d", err);
+		goto init_fail;
+	}
+
+	TSRA_DEV_LOG_EXIT(dev, "%s tsra_ctrl:%p\n", __func__, ctrl);
+	return 0;
+
+init_fail:
+	return err;
+}
+
+int tsra_ctrl_sw_enable(struct tsra_ctrl *ctrl, const bool abort)
+{
+	int err;
+	const struct device *dev = &ctrl->pdev->dev;
+	union tsra_ctrl_reg_cc cc;
+	u8 res_cnt = TSRA_MIN(TSRA_CTRL_MAX_RES_CNT, tsra_ctrl_pf_res_cnt);
+
+	TSRA_DEV_LOG_ENTRY(dev, "%s tsra_ctrl:%p\n", __func__, ctrl);
+
+	tasklet_init(&ctrl->tasklet, tsra_ctrl_soft_irq, (unsigned long)ctrl);
+
+	err = pci_request_irq(ctrl->pdev, TSRA_CTRL_IRQ_NUM, tsra_ctrl_irq,
+			      NULL, ctrl, "tsra_ctrl-%d",
+			      TSRA_CTRL_IRQ_NUM);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			dev, "request irq failed for controller, vector=%d",
+			TSRA_CTRL_IRQ_NUM);
+		goto request_irq_fail;
+	}
+
+	err = tsra_ctrl_page_pool_create(ctrl, abort);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			dev,
+			"%s tsra_ctrl:%p tsra_ctrl_page_pool_create failed err:%d\n",
+			__func__, ctrl, err);
+		goto dma_pool_fail;
+	}
+
+	err = tsra_ctrl_ident_init(ctrl);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			dev,
+			"%s tsra_ctrl:%p tsra_ctrl_ident_init failed err:%d\n",
+			__func__, ctrl, err);
+		goto ident_init_fail;
+	}
+
+	// Set IO Queue entry sizes
+	cc.val = readl(&ctrl->reg->cc);
+	cc.fld.cp_iocqes = ctrl->ident->cp_cqes.fld.max;
+	cc.fld.cp_iosqes = ctrl->ident->cp_sqes.fld.max;
+	cc.fld.fp_iocqes = ctrl->ident->fp_cqes.fld.max;
+	cc.fld.fp_iosqes = ctrl->ident->fp_sqes.fld.max;
+	writel(cc.val, &ctrl->reg->cc);
+
+	if (ctrl->is_pf && res_cnt > 0) {
+		err = tsra_ctrl_cmd_set_res_cnt(ctrl, ctrl->ident->ctrl_id,
+						res_cnt);
+		if (err) {
+			TSRA_DEV_LOG_ERROR(
+				dev,
+				"%s tsra_ctrl:%p failed to set resource count err:%d\n",
+				__func__, ctrl, err);
+		} else {
+			TSRA_DEV_LOG_INFO(
+				dev,
+				"%s tsra_ctrl:%p set resource count to %d",
+				__func__, ctrl, res_cnt);
+		}
+	}
+
+	err = tsra_ctrl_hsm_init(ctrl, abort);
+	if (err) {
+		TSRA_DEV_LOG_ERROR(
+			dev,
+			"%s tsra_ctrl:%p tsra_ctrl_hsm_init failed err:%d\n",
+			__func__, ctrl, err);
+
+		goto dev_init_fail;
+	}
+
+	if (tsra_ctrl_fp_disabled()) {
+		TSRA_DEV_LOG_ALWAYS(
+			dev,
+			"%s tsra_ctrl:%p no_fp set, skipping FP bulk crypto (AES) init\n",
+			__func__, ctrl);
+	} else {
+		ctrl->aes.dev_kobj = ctrl->hsm.dev_kobj;
+		err = tsra_ctrl_aes_init(ctrl, abort);
+		if (err) {
+			TSRA_DEV_LOG_ERROR(
+				dev,
+				"%s tsra_ctrl:%p tsra_ctrl_aes_init failed err:%d\n",
+				__func__, ctrl, err);
+			goto aes_init_fail;
+		}
+	}
+
+	// We will start firing the commands to the controller here.
+	// Mark the controller as ready to accept interrupts
+	TSRA_CTRL_ST_READY(ctrl);
+	ctrl->ctrl_irq_allocated = true;
+	return 0;
+
+aes_init_fail:
+	tsra_ctrl_hsm_deinit(ctrl, abort);
+dev_init_fail:
+	tsra_ctrl_ident_deinit(ctrl);
+ident_init_fail:
+	tsra_ctrl_page_pool_destroy(ctrl, abort);
+dma_pool_fail:
+	pci_free_irq(ctrl->pdev, TSRA_CTRL_IRQ_NUM, ctrl);
+	ctrl->ctrl_irq_allocated = false;
+request_irq_fail:
+	return err;
+}
+
+void tsra_ctrl_sw_disable(struct tsra_ctrl *ctrl, const bool abort)
+{
+	TSRA_LOG_ENTRY("%s tsra_ctrl:%p\n", __func__, ctrl);
+	if (!tsra_ctrl_fp_disabled())
+		tsra_ctrl_aes_deinit(ctrl, abort);
+	tsra_ctrl_hsm_deinit(ctrl, abort);
+	tsra_ctrl_ident_deinit(ctrl);
+	tsra_ctrl_page_pool_destroy(ctrl, abort);
+	if (true == ctrl->ctrl_irq_allocated) {
+		pci_free_irq(ctrl->pdev, TSRA_CTRL_IRQ_NUM, ctrl);
+		ctrl->ctrl_irq_allocated = false;
+	}
+	TSRA_LOG_EXIT("%s tsra_ctrl:%p\n", __func__, ctrl);
+}
+
+void tsra_setup_hmon(struct tsra_ctrl *ctrl)
+{
+	if (!ctrl->hmon.init_done) {
+		TSRA_LOG_INFO("%s: Setting Up Health Mon Timer [%p]\n",
+			      __func__, ctrl);
+
+		ctrl->hmon.init_done = true;
+		ctrl->hmon.ctrl = ctrl;
+		INIT_DELAYED_WORK(&ctrl->hmon.hmon_work, tsra_health_monitor);
+
+		schedule_delayed_work(&ctrl->hmon.hmon_work,
+				      TSRA_HEALTH_MON_TIME);
+	}
+}
+
+void tsra_cleanup_hmon(struct tsra_ctrl *ctrl)
+{
+	TSRA_LOG_ENTRY("%s:Cleaning Up Health Moniter Timer [%p]\n", __func__,
+		       ctrl);
+
+	cancel_delayed_work_sync(&ctrl->hmon.hmon_work);
+	ctrl->hmon.init_done = false;
+	ctrl->hmon.ctrl = NULL;
+}
+
+int tsra_ctrl_init(struct tsra_ctrl *ctrl,
+		     const struct tsra_ctrl_cfg *cfg, const bool abort)
+{
+	int err;
+	struct tsra_ioq_cfg ioq_cfg = { 0 };
+	union tsra_ctrl_cmd_feat_data feat_data = { 0 };
+	struct fw_capabilities fw_caps;
+
+	TSRA_CTRL_ST_RESET(ctrl);
+	TSRA_CTRL_SET_ABORT_STATE(ctrl, TSRA_CONTROLLER_IS_NOT_IN_ABORT);
+
+	ctrl->pdev = cfg->pdev;
+	ctrl->reg = cfg->ctrl_reg;
+	ctrl->db_reg = cfg->db_reg;
+	ctrl->irq_cnt = cfg->irq_cnt;
+	ctrl->is_pf = cfg->is_pf;
+	ctrl->ctrl_irq_allocated = false;
+	snprintf(ctrl->drv_rev, sizeof(ctrl->drv_rev), "%s",
+		 TSRA_DRIVER_VERSION);
+
+	ioq_cfg.id = TSRA_CTRL_IOQ_ID;
+	ioq_cfg.size = TSRA_CTRL_IOQ_SIZE;
+	ioq_cfg.db = ctrl->db_reg;
+	ioq_cfg.ops = &tsra_ctrl_ioq_ops;
+	ioq_cfg.dev = &ctrl->pdev->dev;
+	TSRA_LOG_ENTRY("%s tsra_ctrl:%p\n", __func__, ctrl);
+
+	TSRA_CTRL_ST_IN_PROGRESS(ctrl);
+
+	if (!abort)
+		mutex_init(&ctrl->abort_mutex);
+
+	err = tsra_ioq_init(&ctrl->ioq, &ioq_cfg);
+	if (err) {
+		TSRA_LOG_ERROR(
+			"[ERROR] %s tsra_ctrl:%p tsra_ioq_init failed err:%d\n",
+			__func__, ctrl, err);
+		goto ioq_fail;
+	}
+
+	err = tsra_ctrl_hw_enable(ctrl);
+	if (err) {
+		TSRA_LOG_ERROR(
+			"%s tsra_ctrl:%p tsra_ctrl_hw_enable failed err:%d\n",
+			__func__, ctrl, err);
+		goto hw_enable_fail;
+	}
+
+	err = tsra_ctrl_sw_enable(ctrl, abort);
+	if (err) {
+		TSRA_LOG_ERROR(
+			"%s tsra_ctrl:%p tsra_ctrl_sw_enable failed err:%d\n",
+			__func__, ctrl, err);
+		goto sw_enable_fail;
+	}
+
+	err = tsra_ctrl_cmd_get_feat(ctrl, TSRA_CTRL_CMD_FEAT_ID_AES_FW_CAPS, &feat_data );
+	if (err) {
+		TSRA_LOG_ERROR(
+			"%s tsra_ctrl:%p tsra_ctrl_cmd_get_feat failed err:%d\n",
+			__func__, ctrl, err);
+		/* This is not fatal, so just continue on and the flags will indicate there are no features */
+	}
+
+	fw_caps = feat_data.fw_caps;
+	ctrl->aes_gcm_align_workaround=fw_caps.aes_gcm_workaround?true:false;
+	TSRA_LOG_INFO("%s Firmware Feature GCM Workaround %d", __func__, ctrl->aes_gcm_align_workaround);
+
+	ctrl->level_one_abort_count = 0;
+	ctrl->level_two_abort_count = 0;
+	ctrl->proc_not_own_fd_cnt = 0;
+	ctrl->session_flush_cnt = 0;
+	ctrl->close_by_not_own_proc_cnt = 0;
+
+	if (!abort)
+		// Everything is good, setup the health Monitor
+		tsra_setup_hmon(ctrl);
+
+	get_random_bytes(&ctrl->entropy_data,
+			 TSRA_CTRL_DEV_INFO_ENTROPY_LENGTH);
+
+	TSRA_LOG_EXIT("%s tsra_ctrl:%p\n", __func__, ctrl);
+	return 0;
+
+sw_enable_fail:
+	tsra_ctrl_hw_disable(ctrl);
+hw_enable_fail:
+	tsra_ioq_deinit(&ctrl->ioq);
+ioq_fail:
+	TSRA_CTRL_ST_RESET(ctrl);
+	return err;
+}
+
+int tsra_ctrl_deinit(struct tsra_ctrl *ctrl, const bool abort,
+			u32 abort_type)
+{
+	int rc = 0;
+
+	TSRA_LOG_ENTRY("%s tsra_ctrl:%p\n", __func__, ctrl);
+	/*
+	 * We are going to return error in case of abort
+	 * as the abort path is the only one looking at this.
+	 * In normal path we do not care about the return value
+	 * as we are shutting down the driver and we want to do best effort cleanup.
+	 * In abort, we do not want to reinitialize the controller
+	 * if the disable/NSSR itself fails.
+	*/
+	if (abort) {
+		//
+		// First disable the hardware if it was abort
+		// And then disable the soft states. We will
+		// Not be firing any commands to hardware in this path
+		// We cannot remove the memory, till the controller is
+		// disabled.
+		//
+		if (abort_type == ABORT_TYPE_APP_L2_CTRL_NSSR) {
+			rc = tsra_ctrl_hw_nssr(ctrl);
+		} else {
+			rc = tsra_ctrl_hw_disable(ctrl);
+		}
+
+		/*
+		 * In level-2 abort, we should first disable the controller,
+		 * wait for the controller to be disabled and then flush all the pending
+		 * commands in the HSM and AES pools. This is to make sure that there is
+		 * no race condition between the interrupt handlers and the abort handler
+		 * flush commands. Once the controller is disabled, we know that the
+		 * ISR would not be firing. We are safe to flush the commands.
+		 * Here are the Steps disabling the controller in level-2 abort:
+		 * 1. Disable the controller by either firing NSSR or disabling the controller
+		 * 2. Deterministic wait for tasklet to finish. After this we are done
+		 *    processing the interrupts as there are no more interrupts coming in after
+		 *    the controller is disabled. This Marks the end of IO completion
+		 *    operations as the completions are not being processed anymore.
+		 * 3. Then Flush all the pending commands in the HSM and AES pools.
+		 *
+		 * Note: tasklet_kill waits for existing tasklet to complete and prevents new tasklets from being scheduled.
+		 * This is needed to make sure that we have completed processing all the interrupts before we flush
+		 * the commands in the HSM and AES pools. If we do not wait for the existing tasklet to complete,
+		 * there is a possibility that the tasklet is in the middle of processing an interrupt and is accessing the
+		 * command structures while we are flushing the commands in the HSM and AES pools,
+		 * which can lead to use after free issues.
+		 */
+
+		TSRA_DEV_LOG_ALWAYS(&ctrl->pdev->dev, "L2-Abort: Kill Tasklet\n");
+		tasklet_kill(&ctrl->tasklet); // Guarantee that the running tasklets are finished and no other tasklets will be scheduled after this.
+
+		TSRA_DEV_LOG_ALWAYS(&ctrl->pdev->dev, "L2-Abort: Flushing all commands in HSM pool\n");
+		tsra_ctrl_flush_cmds_from_ioqs(ctrl, &ctrl->hsm.ioq_pool);
+
+		if (!tsra_ctrl_fp_disabled()) {
+			TSRA_DEV_LOG_ALWAYS(&ctrl->pdev->dev, "L2-Abort: Flushing all commands in AES pool\n");
+			tsra_ctrl_flush_cmds_from_ioqs(ctrl, &ctrl->aes.ioq_pool);
+		}
+
+		tsra_ctrl_sw_disable(ctrl, abort);
+
+	} else {
+		//
+		// We are shutting down, disable the
+		// health monitor.
+		//
+		tsra_cleanup_hmon(ctrl);
+
+		//
+		// In normal run, first disable the software
+		// and then disable the hardware, You will be
+		// firing the delete queue commands here which need
+		// to respond, and then freeing the queue's memory out.
+		//
+		tsra_ctrl_sw_disable(ctrl, abort);
+		tsra_ctrl_hw_disable(ctrl);
+	}
+
+	tsra_ioq_deinit(&ctrl->ioq);
+	ctrl->reg = NULL;
+	ctrl->db_reg = NULL;
+	ctrl->irq_cnt = 0;
+
+	TSRA_CTRL_ST_RESET(ctrl);
+
+	TSRA_LOG_EXIT("%s tsra_ctrl:%p rc=%d [%s]\n", __func__, ctrl, rc, rc ? "ERROR" : "SUCCESS");
+	return rc;
+}
+
+/*
+ * Function :- tsra_ctrl_dev_get_dev_info
+ * Accessor function to get the information for the device
+ * Returns PCI bus device function, name
+ *  and information from the FW
+ *
+ * The data that is returned is copied from the
+ * CONTROLLER identify information
+ *
+ * Do not assume that our identify structures are NULL
+ * terminated. There is no need to NULL terminate user
+ * buffers
+ *
+ * Always returns 0
+ *
+ * This function can be called in any context
+ */
+int tsra_ctrl_dev_get_dev_info(struct tsra_ctrl *ctrl,
+			       struct tsra_ctrl_dev_info *dev_info)
+{
+	size_t entropy_size =
+		(sizeof(dev_info->device_entropy) < sizeof(ctrl->entropy_data) ?
+			 sizeof(dev_info->device_entropy) :
+			 sizeof(ctrl->entropy_data));
+	const char *tsra_pci_name = pci_name(ctrl->pdev);
+
+	dev_info->id = ctrl->ident->ctrl_id;
+	strscpy(dev_info->pci_info, tsra_pci_name,
+		sizeof(dev_info->pci_info));
+
+	memset(dev_info->serial_num, 0, sizeof(dev_info->serial_num));
+	memcpy(dev_info->serial_num, ctrl->ident->sn, sizeof(ctrl->ident->sn));
+
+	memset(dev_info->model_num, 0, sizeof(dev_info->model_num));
+
+	memset(dev_info->firmware_rev, 0, sizeof(dev_info->firmware_rev));
+	memcpy(dev_info->firmware_rev, ctrl->ident->fr,
+	       sizeof(ctrl->ident->fr));
+
+	memset(dev_info->driver_rev, 0, sizeof(dev_info->driver_rev));
+	memcpy(dev_info->driver_rev, ctrl->drv_rev, sizeof(ctrl->drv_rev));
+
+	memcpy(dev_info->device_entropy, ctrl->entropy_data, entropy_size);
+	return 0;
+}
