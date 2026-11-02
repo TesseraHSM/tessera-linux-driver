@@ -263,11 +263,22 @@ struct reset_device_data {
 #define TSRA_MAX_DATA_XFER_BUFFERS 64
 #define TSRA_MAX_DATA_XFER_PER_BUFFER (64 * 1024)
 
+/*
+ * Per-buffer flags. By default a data transfer buffer is read by the device
+ * (DMA_TO_DEVICE). TSRA_DATA_XFER_BUF_DEV_WRITE marks a buffer the device
+ * writes (DMA_FROM_DEVICE), e.g. the output of an out-of-band crypto op.
+ * The flags word occupies what was previously implicit padding, so the
+ * structure layout is unchanged. Unknown bits are rejected.
+ */
+#define TSRA_DATA_XFER_BUF_DEV_WRITE 0x1u
+#define TSRA_DATA_XFER_BUF_FLAGS_MASK (TSRA_DATA_XFER_BUF_DEV_WRITE)
+
 struct tsra_hsm_dataxfer_buffers {
 	__u32 buffer_cnt;
 
 	struct {
 		__u32 xfer_length;
+		__u32 flags;
 		__u8 *buf_addr;
 	} buffers[TSRA_MAX_DATA_XFER_BUFFERS];
 

@@ -1066,7 +1066,9 @@ static int tsra_ioctl_hsm_process_data_xfer(
 					hsm->pdev,
 					user_data_xfer_cmd->dataxfer_buffers.buffers[i].buf_addr,
 				   	user_data_xfer_cmd->dataxfer_buffers.buffers[i].xfer_length,
-					DMA_TO_DEVICE,
+					(user_data_xfer_cmd->dataxfer_buffers.buffers[i].flags &
+					 TSRA_DATA_XFER_BUF_DEV_WRITE) ?
+						DMA_FROM_DEVICE : DMA_TO_DEVICE,
 				   &dma_io[i]);
 
 		if (err) {
@@ -1929,6 +1931,17 @@ static int tsra_ioctl_hsm_validate_data_xfer(
 				__func__, i,
 				user_data_xfer_cmd->dataxfer_buffers.buffers[i].xfer_length,
 				TSRA_MAX_DATA_XFER_PER_BUFFER);
+			user_data_xfer_cmd->generic_cmd.out.u.generic.ioctl_extended_status =
+				TSRA_CP_GENERIC_IOCTL_INVALID_INPUT_BUFFER;
+			return -EINVAL;
+		}
+
+		if (user_data_xfer_cmd->dataxfer_buffers.buffers[i].flags & ~TSRA_DATA_XFER_BUF_FLAGS_MASK) {
+			TSRA_DEV_LOG_ERROR(
+				ctxt->hsm->cdev_dev,
+				"[%s:ERROR] Data transfer buffer[%d] has unknown flags [0x%x]\n",
+				__func__, i,
+				user_data_xfer_cmd->dataxfer_buffers.buffers[i].flags);
 			user_data_xfer_cmd->generic_cmd.out.u.generic.ioctl_extended_status =
 				TSRA_CP_GENERIC_IOCTL_INVALID_INPUT_BUFFER;
 			return -EINVAL;
