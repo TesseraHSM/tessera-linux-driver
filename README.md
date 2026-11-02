@@ -6,7 +6,7 @@
 ## Overview
 
 This directory contains the Linux kernel driver source code for the **Tessera Integrated HSM** device. The driver builds as an out-of-tree kernel module named `tsra.ko`.
-
+Development status: This project is still under development and is not yet ready for deployment.
 ---
 
 ## Build Instructions
