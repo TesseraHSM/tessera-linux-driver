@@ -1066,7 +1066,7 @@ static int tsra_ioctl_hsm_process_data_xfer(
 					hsm->pdev,
 					user_data_xfer_cmd->dataxfer_buffers.buffers[i].buf_addr,
 				   	user_data_xfer_cmd->dataxfer_buffers.buffers[i].xfer_length,
-					DMA_TO_DEVICE,
+					DMA_BIDIRECTIONAL,
 				   &dma_io[i]);
 
 		if (err) {
