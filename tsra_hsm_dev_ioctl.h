@@ -5,6 +5,11 @@
 
 #include <linux/types.h>
 #include <linux/ioctl.h>
+#ifdef __KERNEL__
+#include <linux/build_bug.h>
+#else
+#include <assert.h>
+#endif
 #include "tsra_ctrl_dev_ioctl.h"
 
 enum CP_CMD_SET {
@@ -275,6 +280,7 @@ struct reset_device_data {
 
 struct tsra_hsm_dataxfer_buffers {
 	__u32 buffer_cnt;
+	__u32 rsvd0;
 
 	struct {
 		__u32 xfer_length;
@@ -284,6 +290,9 @@ struct tsra_hsm_dataxfer_buffers {
 
 	__u32 rsvd[128];
 };
+
+static_assert(sizeof(struct tsra_hsm_dataxfer_buffers) == 1544,
+	      "Data transfer buffer layout must retain its 64-bit ioctl ABI size");
 
 struct tsra_ctrl_data_xfer_cmd {
 	struct tsra_cp_generic_cmd generic_cmd;
