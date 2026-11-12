@@ -433,7 +433,7 @@ void tsra_dma_io_cleanup(struct tsra_dma_io *dma_io)
 	 * pci mapping.
 	 */
 	if (dma_io->sg_cnt > 0) {
-		dma_unmap_sg(&dma_io->pdev->dev, dma_io->sg, dma_io->sg_cnt,
+		dma_unmap_sg(&dma_io->pdev->dev, dma_io->sg, dma_io->page_cnt,
 			     dma_io->dir);
 
 		dma_io->sg_cnt = 0;
