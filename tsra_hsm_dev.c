@@ -23,6 +23,8 @@ static DEFINE_IDA(tsra_hsm_dev_ida);
 static struct class *tsra_hsm_dev_class;
 static unsigned int tsra_hsm_dev_major;
 
+#define TSRA_FLUSH_SESSION_MAX_ATTEMPTS 5
+
 static void tsra_hsm_close_sessions(struct tsra_hsm_fd_ctxt *ctxt)
 {
 	/* walk through all open sessions and close them */
@@ -258,9 +260,40 @@ void tsra_hsm_force_close_session(struct tsra_hsm *hsm,
 	 * arrives and the timeout path is guaranteed to run).
 	 * The mutex is only needed to serialise the session_flush_cnt update.
 	 */
-	(void)tsra_hsm_passthrough_cmd(hsm, TSRA_HSM_FLUSH_SESSION_OPCODE,
-					 CP_CMD_SESSION_GENERIC, 0, 0, 0, 0, 0,
-					 0, 0, &src_data, NULL, &cpl_sts_out);
+	int err;
+	int attempt;
+	int tries = 0;
+
+	for (attempt = 0; attempt < TSRA_FLUSH_SESSION_MAX_ATTEMPTS; attempt++) {
+		tries++;
+		err = tsra_hsm_passthrough_cmd(hsm, TSRA_HSM_FLUSH_SESSION_OPCODE,
+					       CP_CMD_SESSION_GENERIC, 0, 0, 0, 0,
+					       0, 0, 0, &src_data, NULL,
+					       &cpl_sts_out);
+		if (err != -EAGAIN)
+			break;
+
+		/*
+		 * The command was rejected because a controller abort is in
+		 * progress (e.g. triggered by a timed-out fast-path command).
+		 * Dropping the FLUSH here would leak the session in firmware
+		 * permanently, since the fd's session slot is cleared by the
+		 * caller. tsra_abort() holds abort_mutex for the whole abort,
+		 * so acquiring it waits for the abort to finish; then retry.
+		 */
+		TSRA_DEV_LOG_ERROR(
+			&hsm->pdev->dev,
+			"[%s] FLUSH_SESSION for session %u rejected (abort in progress), attempt %d. Waiting for abort to finish\n",
+			__func__, session_id, tries);
+		mutex_lock(&hsm->ctrl->abort_mutex);
+		mutex_unlock(&hsm->ctrl->abort_mutex);
+	}
+
+	if (err || cpl_sts_out != TSRA_IOQ_CMD_STS_SUCCESS)
+		TSRA_DEV_LOG_ERROR(
+			&hsm->pdev->dev,
+			"[%s] FLUSH_SESSION for session %u failed err:%d cpl_sts:%u attempts:%d. Session may be leaked in firmware\n",
+			__func__, session_id, err, cpl_sts_out, tries);
 
 	mutex_lock(&hsm->ctrl->abort_mutex);
 	hsm->ctrl->session_flush_cnt += 1;
