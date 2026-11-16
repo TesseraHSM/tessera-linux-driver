@@ -39,15 +39,15 @@ static void tsra_aes_dev_cmd_set_output_data(
 	out_data->fips_approved = aes_cmd->cqe.fips_approved;
 
 	//
-	// out_data->byte_count is used in different checks in this function 
-	// It need to be filled here. 
-	// If there is an error, then it will be set to 0 and the error code will be in extended_status. 
+	// out_data->byte_count is used in different checks in this function
+	// It need to be filled here.
+	// If there is an error, then it will be set to 0 and the error code will be in extended_status.
 	//
 	out_data->byte_count = aes_cmd->cqe.len;
 
 	// We made the src buffer len be aligned, so grab it now before we fix it
 	aligned_data_len =  in_data->UserBuff.src_len-aes_cmd->unaligned_data_size;
-	
+
 	TSRA_DEV_LOG_ENTRY(
 		&aes->pdev->dev,
 		"set_output_data. aes:%p cmd status:%d opc:%d cipher:%d cqe err:%d\n",
@@ -65,7 +65,7 @@ static void tsra_aes_dev_cmd_set_output_data(
 	//
 	// Additional checks in case FW has problems
 	//
-	
+
 	// make sure the reported length does not exceed the actual space we were passed
 	if (out_data->byte_count > in_data->UserBuff.dst_len) {
 		TSRA_DEV_LOG_ERROR(
@@ -747,8 +747,8 @@ static int tsra_aes_dev_validate_ioctl(
 			"[%s:ERROR] AES Ioctl. ctxt=%p frame type in ioctl is not AES.\n",
 			__func__, ctxt);
 		rc = -EINVAL;
-	} else if ( 
-			(allow_zero_sz_user_buffer == false) && 
+	} else if (
+			(allow_zero_sz_user_buffer == false) &&
 			(!aes_ioctl_buffer->in_data.UserBuff.src_ptr || !aes_ioctl_buffer->in_data.UserBuff.src_len)) {
 
 		aes_ioctl_buffer->out_data.byte_count = 0;
@@ -761,7 +761,7 @@ static int tsra_aes_dev_validate_ioctl(
 		rc = -EINVAL;
 
 	} else if (
-		(allow_zero_sz_user_buffer == false) &&  
+		(allow_zero_sz_user_buffer == false) &&
 		(!aes_ioctl_buffer->in_data.UserBuff.dst_ptr || !aes_ioctl_buffer->in_data.UserBuff.dst_len)) {
 
 		aes_ioctl_buffer->out_data.byte_count = 0;
@@ -896,7 +896,7 @@ tsra_aes_dev_enc_dec_ioctl(struct tsra_aes *aes,
 			aes_ioctl_buf->in_data.xts_or_gcm.gcm.enable_gcm_workaround) {
 
 		if ((aes_ioctl_buf->in_data.UserBuff.src_ptr) && (aes_ioctl_buf->in_data.UserBuff.src_len) ) {
-			
+
 			aes_cmd.unaligned_data_size = aes_ioctl_buf->in_data.UserBuff.src_len % TSRA_AES_GCM_DATA_SZ_ALIGNMENT_BYTES;
 
 			if (aes_cmd.unaligned_data_size) {
@@ -920,7 +920,7 @@ tsra_aes_dev_enc_dec_ioctl(struct tsra_aes *aes,
 
 			// Now, we need to adjust the buffer lengths before we allocate the SGLs
 			in_data->UserBuff.src_len -= aes_cmd.unaligned_data_size;
-			
+
 			if (in_data->UserBuff.dst_ptr && in_data->UserBuff.dst_len) {
 				in_data->UserBuff.dst_len -= aes_cmd.unaligned_data_size;
 			}
@@ -1082,7 +1082,7 @@ tsra_aes_dev_enc_dec_ioctl(struct tsra_aes *aes,
 			aes_cmd.sqe.cmd_spec.u.gcm.unaligned_src_data_len,
 			aes_cmd.sqe.cmd_spec.u.gcm.unaligned_src_data_addr_high,
 			aes_cmd.sqe.cmd_spec.u.gcm.unaligned_src_data_addr_low);
-		
+
 		// Copy the unaligned data at the end of the UserBuffer
 		// into the DMA buffer we allocated above. This looks like we are
 		// accessing data past the end of teh buffer, but the data was passed
