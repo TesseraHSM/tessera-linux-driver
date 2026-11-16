@@ -339,6 +339,7 @@ static void tsra_remove(struct pci_dev *pdev)
 {
 	struct tsra_dev *mdev = pci_get_drvdata(pdev);
 
+	tsra_ctrl_quiesce_recovery(&mdev->ctrl);
 	TSRA_DEV_LOG_ENTRY(&pdev->dev, "%s pdev:%p mdev:%p\n", __func__, pdev,
 			   mdev);
 
@@ -361,6 +362,7 @@ static void tsra_shutdown(struct pci_dev *pdev)
 {
 	struct tsra_dev *mdev = pci_get_drvdata(pdev);
 
+	tsra_ctrl_quiesce_recovery(&mdev->ctrl);
 	TSRA_DEV_LOG_ENTRY(&pdev->dev, "pdev:%p\n", pdev);
 	tsra_ctrl_hw_disable(&mdev->ctrl);
 	pci_set_drvdata(pdev, NULL);

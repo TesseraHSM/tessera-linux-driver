@@ -663,6 +663,26 @@ init_fail:
 	return err;
 }
 
+static void tsra_ctrl_disable_irq(struct tsra_ctrl *ctrl)
+{
+	if (!ctrl->ctrl_irq_allocated || ctrl->ctrl_irq_disabled)
+		return;
+
+	disable_irq(pci_irq_vector(ctrl->pdev, TSRA_CTRL_IRQ_NUM));
+	tasklet_kill(&ctrl->tasklet);
+	ctrl->ctrl_irq_disabled = true;
+}
+
+static void tsra_ctrl_free_irq(struct tsra_ctrl *ctrl)
+{
+	if (!ctrl->ctrl_irq_allocated)
+		return;
+
+	tsra_ctrl_disable_irq(ctrl);
+	pci_free_irq(ctrl->pdev, TSRA_CTRL_IRQ_NUM, ctrl);
+	ctrl->ctrl_irq_allocated = false;
+}
+
 int tsra_ctrl_sw_enable(struct tsra_ctrl *ctrl, const bool abort)
 {
 	int err;
@@ -684,6 +704,7 @@ int tsra_ctrl_sw_enable(struct tsra_ctrl *ctrl, const bool abort)
 		goto request_irq_fail;
 	}
 
+	ctrl->ctrl_irq_allocated = true;
 	err = tsra_ctrl_page_pool_create(ctrl, abort);
 	if (err) {
 		TSRA_DEV_LOG_ERROR(
@@ -753,10 +774,8 @@ int tsra_ctrl_sw_enable(struct tsra_ctrl *ctrl, const bool abort)
 		}
 	}
 
-	// We will start firing the commands to the controller here.
-	// Mark the controller as ready to accept interrupts
+	// Mark the controller as ready to accept commands.
 	TSRA_CTRL_ST_READY(ctrl);
-	ctrl->ctrl_irq_allocated = true;
 	return 0;
 
 aes_init_fail:
@@ -766,8 +785,7 @@ dev_init_fail:
 ident_init_fail:
 	tsra_ctrl_page_pool_destroy(ctrl, abort);
 dma_pool_fail:
-	pci_free_irq(ctrl->pdev, TSRA_CTRL_IRQ_NUM, ctrl);
-	ctrl->ctrl_irq_allocated = false;
+	tsra_ctrl_free_irq(ctrl);
 request_irq_fail:
 	return err;
 }
@@ -778,12 +796,9 @@ void tsra_ctrl_sw_disable(struct tsra_ctrl *ctrl, const bool abort)
 	if (!tsra_ctrl_fp_disabled())
 		tsra_ctrl_aes_deinit(ctrl, abort);
 	tsra_ctrl_hsm_deinit(ctrl, abort);
+	tsra_ctrl_free_irq(ctrl);
 	tsra_ctrl_ident_deinit(ctrl);
 	tsra_ctrl_page_pool_destroy(ctrl, abort);
-	if (true == ctrl->ctrl_irq_allocated) {
-		pci_free_irq(ctrl->pdev, TSRA_CTRL_IRQ_NUM, ctrl);
-		ctrl->ctrl_irq_allocated = false;
-	}
 	TSRA_LOG_EXIT("%s tsra_ctrl:%p\n", __func__, ctrl);
 }
 
@@ -807,9 +822,23 @@ void tsra_cleanup_hmon(struct tsra_ctrl *ctrl)
 	TSRA_LOG_ENTRY("%s:Cleaning Up Health Moniter Timer [%p]\n", __func__,
 		       ctrl);
 
-	cancel_delayed_work_sync(&ctrl->hmon.hmon_work);
-	ctrl->hmon.init_done = false;
-	ctrl->hmon.ctrl = NULL;
+	if (ctrl->hmon.init_done) {
+		cancel_delayed_work_sync(&ctrl->hmon.hmon_work);
+		ctrl->hmon.init_done = false;
+		ctrl->hmon.ctrl = NULL;
+	}
+}
+
+void tsra_ctrl_quiesce_recovery(struct tsra_ctrl *ctrl)
+{
+	mutex_lock(&ctrl->hmon_mutex);
+	mutex_lock(&ctrl->abort_mutex);
+	ctrl->recovery_enabled = false;
+	mutex_unlock(&ctrl->abort_mutex);
+
+	/* A pending monitor may need abort_mutex while cancellation waits. */
+	tsra_cleanup_hmon(ctrl);
+	mutex_unlock(&ctrl->hmon_mutex);
 }
 
 int tsra_ctrl_init(struct tsra_ctrl *ctrl,
@@ -829,6 +858,7 @@ int tsra_ctrl_init(struct tsra_ctrl *ctrl,
 	ctrl->irq_cnt = cfg->irq_cnt;
 	ctrl->is_pf = cfg->is_pf;
 	ctrl->ctrl_irq_allocated = false;
+	ctrl->ctrl_irq_disabled = false;
 	snprintf(ctrl->drv_rev, sizeof(ctrl->drv_rev), "%s",
 		 TSRA_DRIVER_VERSION);
 
@@ -841,8 +871,11 @@ int tsra_ctrl_init(struct tsra_ctrl *ctrl,
 
 	TSRA_CTRL_ST_IN_PROGRESS(ctrl);
 
-	if (!abort)
+	if (!abort) {
 		mutex_init(&ctrl->abort_mutex);
+		mutex_init(&ctrl->hmon_mutex);
+		ctrl->recovery_enabled = true;
+	}
 
 	err = tsra_ioq_init(&ctrl->ioq, &ioq_cfg);
 	if (err) {
@@ -934,30 +967,15 @@ int tsra_ctrl_deinit(struct tsra_ctrl *ctrl, const bool abort,
 		}
 
 		/*
-		 * In level-2 abort, we should first disable the controller,
-		 * wait for the controller to be disabled and then flush all the pending
-		 * commands in the HSM and AES pools. This is to make sure that there is
-		 * no race condition between the interrupt handlers and the abort handler
-		 * flush commands. Once the controller is disabled, we know that the
-		 * ISR would not be firing. We are safe to flush the commands.
-		 * Here are the Steps disabling the controller in level-2 abort:
-		 * 1. Disable the controller by either firing NSSR or disabling the controller
-		 * 2. Deterministic wait for tasklet to finish. After this we are done
-		 *    processing the interrupts as there are no more interrupts coming in after
-		 *    the controller is disabled. This Marks the end of IO completion
-		 *    operations as the completions are not being processed anymore.
-		 * 3. Then Flush all the pending commands in the HSM and AES pools.
-		 *
-		 * Note: tasklet_kill waits for existing tasklet to complete and prevents new tasklets from being scheduled.
-		 * This is needed to make sure that we have completed processing all the interrupts before we flush
-		 * the commands in the HSM and AES pools. If we do not wait for the existing tasklet to complete,
-		 * there is a possibility that the tasklet is in the middle of processing an interrupt and is accessing the
-		 * command structures while we are flushing the commands in the HSM and AES pools,
-		 * which can lead to use after free issues.
+		 * Disabling hardware does not drain host IRQs or their tasklets.
+		 * Synchronize each IRQ, then drain its tasklet before flushing
+		 * commands while all queues are still alive.
 		 */
-
-		TSRA_DEV_LOG_ALWAYS(&ctrl->pdev->dev, "L2-Abort: Kill Tasklet\n");
-		tasklet_kill(&ctrl->tasklet); // Guarantee that the running tasklets are finished and no other tasklets will be scheduled after this.
+		TSRA_DEV_LOG_ALWAYS(&ctrl->pdev->dev, "L2-Abort: Disable Interrupts + Kill Tasklet\n");
+		tsra_ctrl_disable_irq(ctrl);
+		tsra_ioq_pool_disable_irqs(&ctrl->hsm.ioq_pool);
+		if (!tsra_ctrl_fp_disabled())
+			tsra_ioq_pool_disable_irqs(&ctrl->aes.ioq_pool);
 
 		TSRA_DEV_LOG_ALWAYS(&ctrl->pdev->dev, "L2-Abort: Flushing all commands in HSM pool\n");
 		tsra_ctrl_flush_cmds_from_ioqs(ctrl, &ctrl->hsm.ioq_pool);
@@ -971,17 +989,16 @@ int tsra_ctrl_deinit(struct tsra_ctrl *ctrl, const bool abort,
 
 	} else {
 		//
-		// We are shutting down, disable the
-		// health monitor.
-		//
-		tsra_cleanup_hmon(ctrl);
-
-		//
 		// In normal run, first disable the software
 		// and then disable the hardware, You will be
 		// firing the delete queue commands here which need
 		// to respond, and then freeing the queue's memory out.
 		//
+		/* Keep the admin IRQ enabled for hardware queue-deletion commands. */
+		tsra_ioq_pool_disable_irqs(&ctrl->hsm.ioq_pool);
+		if (!tsra_ctrl_fp_disabled())
+			tsra_ioq_pool_disable_irqs(&ctrl->aes.ioq_pool);
+
 		tsra_ctrl_sw_disable(ctrl, abort);
 		tsra_ctrl_hw_disable(ctrl);
 	}
