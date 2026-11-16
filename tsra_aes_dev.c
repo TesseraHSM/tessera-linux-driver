@@ -775,6 +775,19 @@ static int tsra_aes_dev_validate_ioctl(
 	}
 
 	if(aes_ioctl_buffer->in_data.UserBuff.src_ptr && aes_ioctl_buffer->in_data.UserBuff.src_len) {
+		if (aes_ioctl_buffer->in_data.UserBuff.src_len > TSRA_AES_MAX_USER_BUFF_SZ) {
+			aes_ioctl_buffer->out_data.byte_count = 0;
+			aes_ioctl_buffer->out_data.extended_status =
+				TSRA_FP_IOCTL_INVALID_INPUT_BUFFER;
+			TSRA_DEV_LOG_ERROR(
+				ctxt->hsm->cdev_dev,
+				"[%s:ERROR] Source Buffer Length Exceeds Max [len->%u:max->%u]\n",
+				__func__, aes_ioctl_buffer->in_data.UserBuff.src_len,
+				TSRA_AES_MAX_USER_BUFF_SZ);
+			rc = -EINVAL;
+			goto validate_done;
+		}
+
 		if (!access_ok(aes_ioctl_buffer->in_data.UserBuff.src_ptr,
 				aes_ioctl_buffer->in_data.UserBuff.src_len)) {
 			aes_ioctl_buffer->out_data.byte_count = 0;
@@ -791,6 +804,19 @@ static int tsra_aes_dev_validate_ioctl(
 	}
 
 	if(aes_ioctl_buffer->in_data.UserBuff.dst_ptr &&  aes_ioctl_buffer->in_data.UserBuff.dst_len) {
+		if (aes_ioctl_buffer->in_data.UserBuff.dst_len > TSRA_AES_MAX_USER_BUFF_SZ) {
+			aes_ioctl_buffer->out_data.byte_count = 0;
+			aes_ioctl_buffer->out_data.extended_status =
+				TSRA_FP_IOCTL_INVALID_OUTPUT_BUFFER;
+			TSRA_DEV_LOG_ERROR(
+				ctxt->hsm->cdev_dev,
+				"[%s:ERROR] Destination Buffer Length Exceeds Max [len->%u:max->%u]\n",
+				__func__, aes_ioctl_buffer->in_data.UserBuff.dst_len,
+				TSRA_AES_MAX_USER_BUFF_SZ);
+			rc = -EINVAL;
+			goto validate_done;
+		}
+
 		if (!access_ok(aes_ioctl_buffer->in_data.UserBuff.dst_ptr,
 				aes_ioctl_buffer->in_data.UserBuff.dst_len)) {
 			aes_ioctl_buffer->out_data.byte_count = 0;

@@ -3,6 +3,7 @@
 //#define DMA_IO_DEBUG_ON 1
 
 #include <linux/mm.h>
+#include <linux/overflow.h>
 #include "tsra_ioq.h"
 #include "tsra_dma_io.h"
 #include "tsra_log.h"
@@ -109,11 +110,16 @@ static int tsra_dma_io_compute_pages(void *ubuff, u32 ubuff_sz)
 {
 	u32 n_pages = 0;
 	unsigned long start = 0, end = 0, uaddr = 0, count = 0;
+	unsigned long sum = 0, span = 0;
 
 	uaddr = (unsigned long)ubuff;
 	count = (unsigned long)ubuff_sz;
 
-	end = (uaddr + count + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	if (check_add_overflow(uaddr, count, &sum) ||
+	    check_add_overflow(sum, (unsigned long)(PAGE_SIZE - 1), &span))
+		return 0;
+
+	end = span >> PAGE_SHIFT;
 	start = uaddr >> PAGE_SHIFT;
 
 	n_pages = end - start;
@@ -171,6 +177,7 @@ static void tsra_dma_io_free_coh_mem(struct tsra_dma_io *dma_io)
 static int tsra_dma_io_alloc_coh_mem(struct tsra_dma_io *dma_io)
 {
 	u32 seg_cnt = 0;
+	u32 coh_mem_sz = 0;
 	u32 data_desc_cnt_per_seg =
 		(PAGE_SIZE / sizeof(struct tsra_dma_io_sgl_desc)) - 1;
 
@@ -180,8 +187,16 @@ static int tsra_dma_io_alloc_coh_mem(struct tsra_dma_io *dma_io)
 	 */
 	seg_cnt = (dma_io->sg_cnt / data_desc_cnt_per_seg) + 1;
 
-	// Total memory size
-	dma_io->coh_mem_sz = (seg_cnt * PAGE_SIZE);
+	if (check_mul_overflow(seg_cnt, (u32)PAGE_SIZE, &coh_mem_sz)) {
+		TSRA_DEV_LOG_ERROR(
+			&dma_io->pdev->dev,
+			"%s: Allocation Size Overflow Computing Coherent Mem Size [seg_cnt:%u] [ENOMEM]\n",
+			__func__, seg_cnt);
+
+		return -ENOMEM;
+	}
+
+	dma_io->coh_mem_sz = coh_mem_sz;
 
 	dma_io->hw_sgl_mem_kva =
 		dma_alloc_coherent(&dma_io->pdev->dev, dma_io->coh_mem_sz,
@@ -290,6 +305,7 @@ int tsra_dma_io_init(
 	int npages_pinned = 0;
 	int rw_flags = 0;
 	u32 sz_to_alloc = 0;
+	u32 sg_arr_sz = 0, pg_arr_sz = 0;
 	int rc = 0;
 
 	if (!pdev)
@@ -332,11 +348,16 @@ int tsra_dma_io_init(
 	 * https://stackoverflow.com/questions/58413297/how-to-avoid-high-cpu-usage-while-reading-writing-character-device
 	 */
 
-	// The size of the scatter gather list that we need
-	sz_to_alloc = sizeof(struct scatterlist) * pg_cnt;
+	if (check_mul_overflow((u32)sizeof(struct scatterlist), pg_cnt, &sg_arr_sz) ||
+	    check_mul_overflow((u32)sizeof(struct page *), pg_cnt, &pg_arr_sz) ||
+	    check_add_overflow(sg_arr_sz, pg_arr_sz, &sz_to_alloc)) {
+		TSRA_DEV_LOG_ERROR(
+			&pdev->dev,
+			"%s: Allocation Size Overflow Computing SG/Page Array Size [pg_cnt:%u] [EINVAL]\n",
+			__func__, pg_cnt);
 
-	//Add the size of the page array that we need to allocate
-	sz_to_alloc += sizeof(struct page *) * pg_cnt;
+		return -EINVAL;
+	}
 
 	dma_io->pg_sg_mem = kzalloc(sz_to_alloc, GFP_KERNEL);
 
@@ -433,7 +454,7 @@ void tsra_dma_io_cleanup(struct tsra_dma_io *dma_io)
 	 * pci mapping.
 	 */
 	if (dma_io->sg_cnt > 0) {
-		dma_unmap_sg(&dma_io->pdev->dev, dma_io->sg, dma_io->sg_cnt,
+		dma_unmap_sg(&dma_io->pdev->dev, dma_io->sg, dma_io->page_cnt,
 			     dma_io->dir);
 
 		dma_io->sg_cnt = 0;
