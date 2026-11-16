@@ -111,7 +111,7 @@ struct __packed tsra_hsm_data_xfer_metadata {
 
 	struct tsra_dma_io_sgl_desc sgl_desc_first[TSRA_MAX_DATA_XFER_DEVICE_BUFFERS];
 
-	uint8_t rsvd[METADATA_SIZE -
+	u8 rsvd[METADATA_SIZE -
 		(sizeof(struct tsra_dma_io_sgl_desc) *
 		 TSRA_MAX_DATA_XFER_DEVICE_BUFFERS)];
 };
