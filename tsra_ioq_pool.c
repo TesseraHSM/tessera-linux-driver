@@ -60,6 +60,16 @@ static void tsra_ioq_pool_soft_irq(unsigned long data)
 	}
 }
 
+static void tsra_ioq_pool_disable_irq(struct tsra_ioq_pool_irq_ctx *irq_ctx)
+{
+	if (irq_ctx->irq_disabled)
+		return;
+
+	disable_irq(irq_ctx->irq);
+	tasklet_kill(&irq_ctx->tasklet);
+	irq_ctx->irq_disabled = true;
+}
+
 static void tsra_ioq_pool_free_irq(struct tsra_ioq_pool *pool, int vec)
 {
 	struct tsra_ioq_pool_irq_ctx *irq_ctx = xa_load(&pool->irqs, vec);
@@ -73,6 +83,7 @@ static void tsra_ioq_pool_free_irq(struct tsra_ioq_pool *pool, int vec)
 		return;
 	}
 
+	tsra_ioq_pool_disable_irq(irq_ctx);
 	xa_erase(&pool->irqs, vec);
 	pci_free_irq(pool->pdev, vec, irq_ctx);
 	xa_destroy(&irq_ctx->ioqs);
@@ -108,6 +119,7 @@ static int tsra_ioq_pool_alloc_irq(struct tsra_ioq_pool *pool, int vec)
 		goto request_irq_fail;
 	}
 
+	irq_ctx->irq = pci_irq_vector(pool->pdev, vec);
 	err = xa_insert(&pool->irqs, vec, irq_ctx, GFP_KERNEL);
 	if (err) {
 		TSRA_DEV_LOG_ERROR(
@@ -121,11 +133,37 @@ static int tsra_ioq_pool_alloc_irq(struct tsra_ioq_pool *pool, int vec)
 	return 0;
 
 ctx_insert_fail:
+	tsra_ioq_pool_disable_irq(irq_ctx);
 	pci_free_irq(pool->pdev, vec, irq_ctx);
 request_irq_fail:
 	kfree(irq_ctx);
 alloc_fail:
 	return err;
+}
+
+void tsra_ioq_pool_disable_irqs(struct tsra_ioq_pool *pool)
+{
+	int id = 0;
+	const int msix_cnt = pool->msix_cnt;
+
+	TSRA_LOG_ENTRY("%s pool:%p msix_cnt:%d\n", __func__, pool, msix_cnt);
+	for (; id < msix_cnt; id++) {
+		int vec = id + pool->msix_start;
+		struct tsra_ioq_pool_irq_ctx *irq_ctx =
+			xa_load(&pool->irqs, vec);
+
+		TSRA_LOG_ENTRY("%s pool:%p disabling irq:%d\n", __func__, pool, vec);
+		if (irq_ctx == NULL) {
+			TSRA_LOG_ERROR(
+				"[ERROR] %s pool:%p irq context not found for vec:%d\n",
+				__func__, pool, vec);
+			continue;
+		}
+
+		tsra_ioq_pool_disable_irq(irq_ctx);
+	}
+
+	TSRA_LOG_EXIT("%s pool:%p msix_cnt:%d\n", __func__, pool, msix_cnt);
 }
 
 static void tsra_ioq_pool_free_irqs(struct tsra_ioq_pool *pool)
@@ -321,7 +359,7 @@ static int tsra_ioq_pool_create_ioq(struct tsra_ioq_pool *pool, u16 ioq_id,
 
 ioq_irq_insert_fail:
 irq_ctx_fail:
-	xa_erase(&pool->irqs, ioq_id);
+	xa_erase(&pool->ioqs, ioq_id);
 ioq_insert_fail:
 	//
 	// This is a failure condition local to this function,
@@ -492,8 +530,11 @@ int tsra_ioq_pool_init(struct tsra_ioq_pool *pool,
 	return 0;
 
 create_ioqs_fail:
-	tsra_ioq_pool_free_irqs(pool);
+	tsra_ioq_pool_deinit(pool, false);
+	return err;
 alloc_irqs_fail:
+	xa_destroy(&pool->ioqs);
+	xa_destroy(&pool->irqs);
 queue_cnt_fail:
 	return err;
 }
@@ -501,6 +542,7 @@ queue_cnt_fail:
 void tsra_ioq_pool_deinit(struct tsra_ioq_pool *pool, const bool abort)
 {
 	TSRA_LOG_ENTRY("%s pool:%p abort_path:%d\n", __func__, pool, abort);
+	tsra_ioq_pool_disable_irqs(pool);
 	tsra_ioq_pool_delete_ioqs(pool, abort);
 	tsra_ioq_pool_free_irqs(pool);
 	if (pool->ioq_max_cnt) {

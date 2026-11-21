@@ -7,10 +7,10 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
-struct tsra_mgt;
+struct tsra_mgmt;
 
 int tsra_mgmt_if_dev_init(struct tsra_mgmt *mgmt, const bool abort);
 
 void tsra_mgmt_if_dev_deinit(struct tsra_mgmt *mgmt, const bool abort);
 
-#endif //_LINUX_TSRA_CTRL_DEV_H
+#endif //_LINUX_TSRA_MGMT_IF_DEV_H

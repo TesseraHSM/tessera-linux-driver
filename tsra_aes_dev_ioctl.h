@@ -17,6 +17,9 @@
 #define TSRA_MAX_UNALIGNED_DATA_SZ (TSRA_AES_GCM_DATA_SZ_ALIGNMENT_BYTES - 1)
 #define TSRA_IS_AAD_ALIGNED(_size, _align) (((_size) % (_align)) == 0)
 
+/* Bound the page-count and DMA allocation arithmetic for fast-path buffers. */
+#define TSRA_AES_MAX_USER_BUFF_SZ (16U * 1024U * 1024U)
+
 //Define the fast path operation codes here
 enum tsra_aes_op_code {
 	TSRA_AES_OP_CODE_START = 0,

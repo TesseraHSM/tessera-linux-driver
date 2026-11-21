@@ -19,6 +19,7 @@ struct tsra_ioq_pool;
 struct tsra_ioq_pool_irq_ctx {
 	struct tsra_ioq_pool *pool;
 	int irq;
+	bool irq_disabled;
 	struct tasklet_struct tasklet;
 	struct xarray ioqs;
 };
@@ -66,6 +67,8 @@ int tsra_ioq_pool_init(struct tsra_ioq_pool *ioq_pool,
 		       struct tsra_ioq_pool_cfg *cfg);
 
 void tsra_ioq_pool_deinit(struct tsra_ioq_pool *ioq_pool, const bool abort);
+
+void tsra_ioq_pool_disable_irqs(struct tsra_ioq_pool *pool);
 
 u16 tsra_ioq_pool_queue_cnt(struct tsra_ioq_pool *ioq_pool);
 

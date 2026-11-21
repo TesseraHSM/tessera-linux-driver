@@ -458,7 +458,26 @@ int tsra_abort(struct tsra_ctrl *ctrl, struct tsra_ioq *ioq,
 	int rc = 0, err = 0;
 	int que_id = 0;
 	bool lvl1_abort = PERFORM_L1_ABORT(abort_type);
-	bool restart_hmon = false;
+
+	/*
+	 * Serialize monitor stop/recover/restart with removal. Stop the monitor
+	 * before taking abort_mutex: its callback may need that mutex while
+	 * cancel_delayed_work_sync() waits. The callback never takes hmon_mutex
+	 * and handles its own rescheduling.
+	 */
+	if (!called_from_hmon) {
+		mutex_lock(&ctrl->hmon_mutex);
+		tsra_cleanup_hmon(ctrl);
+	}
+	mutex_lock(&ctrl->abort_mutex);
+
+	if (!ctrl->recovery_enabled) {
+		TSRA_DEV_LOG_INFO(
+			dev, "Skipping abort while driver is being removed ctrl:%p\n",
+			ctrl);
+		rc = -ENODEV;
+		goto unlock;
+	}
 
 	/*
 	 * We will not derference the queue id.
@@ -476,8 +495,6 @@ int tsra_abort(struct tsra_ctrl *ctrl, struct tsra_ioq *ioq,
 		"[ENTRY:%s] ctrl:%p ioq:%p ioq id[%d] level one abort count:%d cpl_object:%p crash:%d\n",
 		__func__, ctrl, ioq, que_id, ctrl->level_one_abort_count,
 		completion_object, crash);
-
-	mutex_lock(&ctrl->abort_mutex);
 
 	/* Indicate that a abort is starting */
 	TSRA_CTRL_SET_ABORT_STATE(ctrl,
@@ -499,8 +516,8 @@ int tsra_abort(struct tsra_ctrl *ctrl, struct tsra_ioq *ioq,
 		TSRA_CTRL_SET_ABORT_STATE(ctrl,
 					  TSRA_CONTROLLER_IS_NOT_IN_ABORT);
 
-		mutex_unlock(&ctrl->abort_mutex);
-		return TSRA_ABORT_LEVEL_TWO_FAILED;
+		rc = TSRA_ABORT_LEVEL_TWO_FAILED;
+		goto unlock;
 	}
 
 	/*
@@ -524,18 +541,6 @@ int tsra_abort(struct tsra_ctrl *ctrl, struct tsra_ioq *ioq,
 	 */
 
 	/*
-	 * We may need to stop the hardware monitor while we do the reset to
-	 * avoid the very small possibility of a check occuring in the
-	 * middle of a reset. Only do this for the paths that are not
-	 * already running hmon code, ie skip the case of hmon performing
-	 * an abort.
-	 */
-	if( !called_from_hmon ) {
-		tsra_cleanup_hmon(ctrl);
-		restart_hmon = true;
-	}
-
-	/*
 	 * Small wait for 100 Jiffies just to check if the command is completed or not.
 	 * If the command is completed, we are good. We do not need to do anything.
 	 * This can happen if some other thread acquired the mutex and completed
@@ -557,11 +562,10 @@ int tsra_abort(struct tsra_ctrl *ctrl, struct tsra_ioq *ioq,
 				ctrl, TSRA_CONTROLLER_IS_NOT_IN_ABORT);
 
 			/* If we stopped hmon above, restart it now */
-			if (restart_hmon )
+			if (!called_from_hmon)
 				tsra_setup_hmon(ctrl);
 
-			mutex_unlock(&ctrl->abort_mutex);
-			return 0;
+			goto unlock;
 		}
 	}
 
@@ -632,7 +636,7 @@ int tsra_abort(struct tsra_ctrl *ctrl, struct tsra_ioq *ioq,
 	 * If we stopped hmon above, and the device successfully initialized,
 	 * restart the hardware monitor now the reset is complete.
 	 */
-	if (rc == 0 && restart_hmon )
+	if (rc == 0 && !called_from_hmon)
 		tsra_setup_hmon(ctrl);
 
 	TSRA_DEV_LOG_EXIT(
@@ -640,7 +644,10 @@ int tsra_abort(struct tsra_ctrl *ctrl, struct tsra_ioq *ioq,
 		"[Exit:%s] ctrl:%p return:%d abort is done. Controller is not in abort\n",
 		__func__, ctrl, rc);
 
+unlock:
 	mutex_unlock(&ctrl->abort_mutex);
+	if (!called_from_hmon)
+		mutex_unlock(&ctrl->hmon_mutex);
 	return rc;
 }
 

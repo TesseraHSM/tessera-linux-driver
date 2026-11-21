@@ -261,6 +261,9 @@ struct tsra_ctrl {
 	 */
 	struct mutex abort_mutex;
 
+	/* Serializes monitor stop/restart; acquired before abort_mutex. */
+	struct mutex hmon_mutex;
+
 	/*
 	 * Flag set to indicate that a abort is in progress
 	 * on this controller.
@@ -268,6 +271,9 @@ struct tsra_ctrl {
 	 * Should only be set holding the abort_mutex
 	 */
 	atomic_t abort_state;
+
+	/* Protected by abort_mutex after initial setup. */
+	bool recovery_enabled;
 
 	/*
 	 * The health monitor for detecting controller crash
@@ -288,6 +294,7 @@ struct tsra_ctrl {
 	* (IRQ bound to admin queue)
 	*/
 	bool ctrl_irq_allocated;
+	bool ctrl_irq_disabled;
 
 	/*
 	* TRUE if the firmware implements the AES GCM alignment workaround
@@ -310,6 +317,7 @@ int tsra_ctrl_hw_enable(struct tsra_ctrl *ctrl);
 int tsra_ctrl_sw_enable(struct tsra_ctrl *ctrl, const bool abort);
 void tsra_setup_hmon(struct tsra_ctrl *ctrl);
 void tsra_cleanup_hmon(struct tsra_ctrl *ctrl);
+void tsra_ctrl_quiesce_recovery(struct tsra_ctrl *ctrl);
 
 /*
  * True when the driver was loaded with no_fp=Y, i.e. without fast path (FP)

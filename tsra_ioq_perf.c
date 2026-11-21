@@ -55,7 +55,7 @@ void tsra_ioq_perf_update_cntrs_after_submission(struct tsra_hsm *hsm,
 	 * get removed and recreated dring the reset.
 	 */
 	if (!TSRA_CTRL_ST_ISRDY(hsm->ctrl)) {
-		pr_err("Ignoring perf counter update during a reset!!!!");
+		pr_err_ratelimited("Ignoring perf counter update during a reset!!!!\n");
 		return;
 	}
 	if (elapsed_time >= ioq->sq.max_time_for_completion)

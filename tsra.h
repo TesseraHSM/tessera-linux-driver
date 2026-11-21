@@ -11,7 +11,7 @@
 #include "tsra_log.h"
 #include "tsra_abort.h"
 
-#define TSRA_DRIVER_VERSION "3.2.120.1"
+#define TSRA_DRIVER_VERSION "3.2.165.1"
 
 struct tsra_dev {
 	struct pci_dev *pdev;
